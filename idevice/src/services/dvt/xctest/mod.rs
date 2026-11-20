@@ -655,6 +655,80 @@ async fn connect_testmanagerd_rsd(
     )))
 }
 
+/// Steps 1 and 3 to 8 of [`XCUITestService::run`], once the DTX connections are open.
+async fn run_session<L: XCUITestListener>(
+    mut conns: TestManagerConnections,
+    ios_major_version: u8,
+    cfg: TestConfig,
+    listener: &mut L,
+    timeout: Option<std::time::Duration>,
+) -> Result<(), IdeviceError> {
+    // 1. Session UUID + config path
+    let session_id = uuid::Uuid::new_v4();
+    let xctest_path = format!(
+        "/tmp/{}.xctestconfiguration",
+        session_id.to_string().to_uppercase()
+    );
+
+    // 3. Build XCTestConfiguration
+    let xctest_config = cfg.build_xctest_configuration(session_id, ios_major_version)?;
+
+    // 4. Open the testmanagerd proxies and process control on the connections
+    let mut ctrl_proxy = TestManagerProxy::open(&mut conns.ctrl, ios_major_version).await?;
+    let mut main_proxy = TestManagerProxy::open(&mut conns.main, ios_major_version).await?;
+    let mut process_control = XCTestProcessControlChannel::open(&mut conns.dvt).await?;
+
+    let config_name = cfg.config_name().to_owned();
+    initialize_testmanager_sessions(&mut ctrl_proxy, &mut main_proxy, &xctest_config).await?;
+    register_early_driver_channel_handler(&mut conns.main, &xctest_config).await;
+    initialize_testmanager_daemon_sessions(
+        &mut ctrl_proxy,
+        &mut main_proxy,
+        ios_major_version,
+        &session_id,
+        &xctest_config,
+    )
+    .await?;
+
+    // Build launch environment from the config
+    let (launch_args, launch_env, launch_options) = build_launch_env(
+        ios_major_version,
+        &session_id,
+        &cfg.runner_app_path,
+        &cfg.runner_app_container,
+        &config_name,
+        &xctest_path,
+        cfg.runner_env.as_ref(),
+        cfg.runner_args.as_deref(),
+    );
+
+    let _pid = launch_and_authorize_test_runner(
+        &mut ctrl_proxy,
+        &mut process_control,
+        ios_major_version,
+        &cfg.runner_bundle_id,
+        launch_args,
+        launch_env,
+        launch_options,
+    )
+    .await?;
+
+    // 6-7. Wait for driver channel and start the test plan.
+    let driver_channel = start_test_plan_session(&mut conns.main, &mut main_proxy).await?;
+
+    // 8. Dispatch loop, raced against the runner connection dropping.
+    run_dispatch_loop_until_done_or_disconnect(
+        &mut conns.main,
+        driver_channel,
+        &xctest_config,
+        listener,
+        timeout,
+    )
+    .await?;
+
+    Ok(())
+}
+
 /// Establishes the three DTX connections required for an XCTest run.
 ///
 /// For iOS 17+ tries `CoreDeviceProxy` + RSD first. Falls back to lockdown
@@ -1982,13 +2056,6 @@ impl XCUITestService {
         listener: &mut L,
         timeout: Option<std::time::Duration>,
     ) -> Result<(), IdeviceError> {
-        // 1. Session UUID + config path
-        let session_id = uuid::Uuid::new_v4();
-        let xctest_path = format!(
-            "/tmp/{}.xctestconfiguration",
-            session_id.to_string().to_uppercase()
-        );
-
         // 2. iOS major version (needed for service selection and launch env)
         let ios_major_version: u8 = {
             let mut lockdown = LockdownClient::connect(&*self.provider).await?;
@@ -2002,64 +2069,57 @@ impl XCUITestService {
                 .unwrap_or(16u8)
         };
 
-        // 3. Build XCTestConfiguration
-        let xctest_config = cfg.build_xctest_configuration(session_id, ios_major_version)?;
+        let conns = connect_testmanagerd(&*self.provider, ios_major_version).await?;
+        run_session(conns, ios_major_version, cfg, listener, timeout).await
+    }
 
-        // 4. Connect to testmanagerd (ctrl + main) and DVT
-        let mut conns = connect_testmanagerd(&*self.provider, ios_major_version).await?;
-        let mut ctrl_proxy = TestManagerProxy::open(&mut conns.ctrl, ios_major_version).await?;
-        let mut main_proxy = TestManagerProxy::open(&mut conns.main, ios_major_version).await?;
-        let mut process_control = XCTestProcessControlChannel::open(&mut conns.dvt).await?;
-
-        let config_name = cfg.config_name().to_owned();
-        initialize_testmanager_sessions(&mut ctrl_proxy, &mut main_proxy, &xctest_config).await?;
-        register_early_driver_channel_handler(&mut conns.main, &xctest_config).await;
-        initialize_testmanager_daemon_sessions(
-            &mut ctrl_proxy,
-            &mut main_proxy,
-            ios_major_version,
-            &session_id,
-            &xctest_config,
+    /// Runs the test plan like [`Self::run`] through an RSD stack the caller already holds.
+    ///
+    /// `run` reaches testmanagerd through lockdown's `CoreDeviceProxy`. A device on
+    /// the network closes that service after the TLS handshake, but serves the same
+    /// RSD services through a tunnel from
+    /// [`RemotePairingClient`](crate::remote_pairing::RemotePairingClient). Pass that
+    /// tunnel's handle and handshake here. The handle is kept for as long as the
+    /// session runs. `ios_major_version` must be 17 or later.
+    pub async fn run_over_rsd<L: XCUITestListener>(
+        mut handle: crate::tcp::handle::AdapterHandle,
+        handshake: &RsdHandshake,
+        ios_major_version: u8,
+        cfg: TestConfig,
+        listener: &mut L,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<(), IdeviceError> {
+        let dvt = rsd_connect(
+            &mut handle,
+            handshake,
+            "com.apple.instruments.dtservicehub",
+            "dtservicehub",
+            true,
         )
         .await?;
-
-        // Build launch environment from the config
-        let (launch_args, launch_env, launch_options) = build_launch_env(
-            ios_major_version,
-            &session_id,
-            &cfg.runner_app_path,
-            &cfg.runner_app_container,
-            &config_name,
-            &xctest_path,
-            cfg.runner_env.as_ref(),
-            cfg.runner_args.as_deref(),
-        );
-
-        let _pid = launch_and_authorize_test_runner(
-            &mut ctrl_proxy,
-            &mut process_control,
-            ios_major_version,
-            &cfg.runner_bundle_id,
-            launch_args,
-            launch_env,
-            launch_options,
+        let ctrl = rsd_connect(
+            &mut handle,
+            handshake,
+            TESTMANAGERD_RSD_SERVICE,
+            "testmanagerd-ctrl",
+            false,
         )
         .await?;
-
-        // 6-7. Wait for driver channel and start the test plan.
-        let driver_channel = start_test_plan_session(&mut conns.main, &mut main_proxy).await?;
-
-        // 8. Dispatch loop, raced against the runner connection dropping.
-        run_dispatch_loop_until_done_or_disconnect(
-            &mut conns.main,
-            driver_channel,
-            &xctest_config,
-            listener,
-            timeout,
+        let main = rsd_connect(
+            &mut handle,
+            handshake,
+            TESTMANAGERD_RSD_SERVICE,
+            "testmanagerd-main",
+            false,
         )
         .await?;
-
-        Ok(())
+        let conns = TestManagerConnections {
+            ctrl,
+            main,
+            dvt,
+            rsd_handles: vec![handle],
+        };
+        run_session(conns, ios_major_version, cfg, listener, timeout).await
     }
 
     /// Starts an XCTest runner intended to host WebDriverAgent and waits
