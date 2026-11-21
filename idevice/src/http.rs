@@ -36,6 +36,7 @@ pub struct HttpRequest {
     url: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    follow_redirects: bool,
 }
 
 impl HttpRequest {
@@ -53,6 +54,7 @@ impl HttpRequest {
             url: url.into(),
             headers: Vec::new(),
             body: Vec::new(),
+            follow_redirects: true,
         }
     }
 
@@ -69,7 +71,14 @@ impl HttpRequest {
         self
     }
 
-    /// Sends the request, following redirects, and returns the final response.
+    /// Returns a redirect as the response instead of following it.
+    #[must_use]
+    pub fn without_redirects(mut self) -> Self {
+        self.follow_redirects = false;
+        self
+    }
+
+    /// Sends the request, following redirects unless told not to, and returns the final response.
     pub async fn send(self) -> Result<HttpResponse, IdeviceError> {
         let mut method = self.method;
         let mut url = self.url;
@@ -79,7 +88,7 @@ impl HttpRequest {
         for _ in 0..=MAX_REDIRECTS {
             let resp = send_once(method, &url, &headers, &body).await?;
             match resp.status {
-                301 | 302 | 303 | 307 | 308 => {
+                301 | 302 | 303 | 307 | 308 if self.follow_redirects => {
                     let Some(location) = resp.header("location") else {
                         return Ok(resp);
                     };
@@ -532,5 +541,38 @@ mod tests {
     fn decodes_chunked_with_extension() {
         let body = b"3;name=value\r\nabc\r\n0\r\n\r\n";
         assert_eq!(decode_chunked(body).unwrap(), b"abc");
+    }
+
+    /// Answers the first request with a redirect to `target` and returns its address.
+    async fn redirecting_to(target: std::net::SocketAddr) -> std::net::SocketAddr {
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = origin.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = origin.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf).await;
+            let reply = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{target}/elsewhere\r\nContent-Length: 0\r\n\r\n"
+            );
+            s.write_all(reply.as_bytes()).await.unwrap();
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn a_request_that_does_not_follow_redirects_returns_the_redirect_and_never_reaches_its_target()
+     {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = redirecting_to(target.local_addr().unwrap()).await;
+        let resp = HttpRequest::post(format!("http://{origin}/TSS"))
+            .body(b"ecid".to_vec())
+            .without_redirects()
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status, 307);
+        let reached =
+            tokio::time::timeout(std::time::Duration::from_millis(200), target.accept()).await;
+        assert!(reached.is_err(), "the redirect target was contacted");
     }
 }

@@ -13,8 +13,8 @@ use crate::IdeviceError;
 
 /// TSS client version string sent in requests
 const TSS_CLIENT_VERSION_STRING: &str = "libauthinstall-1033.0.2";
-/// Apple's TSS endpoint URL
-const TSS_CONTROLLER_ACTION_URL: &str = "http://gs.apple.com/TSS/controller?action=2";
+/// Apple's TSS endpoint URL. The request carries the device's ECID and nonces, so it goes over HTTPS.
+const TSS_CONTROLLER_ACTION_URL: &str = "https://gs.apple.com/TSS/controller?action=2";
 
 /// Represents a TSS request to Apple's signing server
 #[derive(Debug)]
@@ -69,19 +69,31 @@ impl TSSRequest {
     /// let response = request.send().await?;
     /// ```
     pub async fn send(&self) -> Result<plist::Value, IdeviceError> {
+        self.send_to(TSS_CONTROLLER_ACTION_URL).await
+    }
+
+    /// A redirect is not followed: it would carry the device's ECID and nonces to another host.
+    async fn send_to(&self, url: &str) -> Result<plist::Value, IdeviceError> {
         debug!(
             "Sending TSS request: {}",
             crate::pretty_print_dictionary(&self.inner)
         );
-        // The TSS controller is plain HTTP, so no TLS/crypto provider is needed.
-        let res = crate::http::HttpRequest::post(TSS_CONTROLLER_ACTION_URL)
+        let res = crate::http::HttpRequest::post(url)
             .header("Cache-Control", "no-cache")
             .header("Content-type", "text/xml; charset=\"utf-8\"")
             .header("User-Agent", "InetURL/1.0")
             .body(plist_to_xml_bytes(&self.inner))
+            .without_redirects()
             .send()
-            .await?
-            .text();
+            .await?;
+        if (300..400).contains(&res.status) {
+            return Err(IdeviceError::Http(format!(
+                "the TSS server answered {} with a redirect to {}, which is not followed",
+                res.status,
+                res.header("location").unwrap_or("nowhere")
+            )));
+        }
+        let res = res.text();
 
         debug!("Apple responded with {res}");
         let trimmed = res.trim_start_matches("STATUS=0&");
@@ -761,4 +773,43 @@ pub fn select_cryptex_build_identity(
             })
         })
         .ok_or(IdeviceError::BadBuildManifest)
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
+
+    #[test]
+    fn the_tss_request_goes_to_apple_over_https() {
+        assert!(TSS_CONTROLLER_ACTION_URL.starts_with("https://gs.apple.com/"));
+    }
+
+    #[tokio::test]
+    async fn a_redirect_from_the_tss_server_is_an_error_and_its_target_is_never_contacted() {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = origin.accept().await.unwrap();
+            let mut buf = [0u8; 8192];
+            let _ = s.read(&mut buf).await;
+            let reply = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{target_addr}/\r\nContent-Length: 0\r\n\r\n"
+            );
+            s.write_all(reply.as_bytes()).await.unwrap();
+        });
+        let sent = TSSRequest::new()
+            .send_to(&format!("http://{origin_addr}/TSS/controller?action=2"))
+            .await;
+        assert!(
+            matches!(&sent, Err(IdeviceError::Http(m)) if m.contains("307")),
+            "{sent:?}"
+        );
+        let reached =
+            tokio::time::timeout(std::time::Duration::from_millis(200), target.accept()).await;
+        assert!(reached.is_err(), "the redirect target was contacted");
+    }
 }
