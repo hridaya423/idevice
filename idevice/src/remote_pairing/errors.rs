@@ -20,6 +20,10 @@ pub enum RemotePairingError {
     #[cfg(feature = "remote_pairing")]
     #[error("Chacha encryption error")]
     ChachaEncryption(chacha20poly1305::Error),
+    #[error("the pairing record holds no public key of the device; pair again")]
+    NoDeviceKey,
+    #[error("the peer did not prove it is the paired device")]
+    DeviceNotVerified,
 }
 
 impl RemotePairingError {
@@ -34,6 +38,8 @@ impl RemotePairingError {
             Self::SrpAuthFailed => 6,
             #[cfg(feature = "remote_pairing")]
             Self::ChachaEncryption(_) => 7,
+            Self::NoDeviceKey => 8,
+            Self::DeviceNotVerified => 9,
         }
     }
 }

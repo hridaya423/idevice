@@ -135,6 +135,10 @@ impl<R: RpPairingSocketProvider> RemotePairingClient<R> {
         &mut self,
         pairing_file: &mut RpPairingFile,
     ) -> Result<(), IdeviceError> {
+        let device_key = pairing_file
+            .device_public_key
+            .and_then(|k| ed25519_dalek::VerifyingKey::from_bytes(&k).ok())
+            .ok_or(RemotePairingError::NoDeviceKey)?;
         let x_private_key = EphemeralSecret::random_from_rng(OsRng);
         let x_public_key = X25519PublicKey::from(&x_private_key);
 
@@ -201,6 +205,7 @@ impl<R: RpPairingSocketProvider> RemotePairingClient<R> {
             }
         };
         let device_public_key = x25519_dalek::PublicKey::from(peer_pub_bytes);
+        let host_public_key = *x_public_key.as_bytes();
         let shared_secret = x_private_key.diffie_hellman(&device_public_key);
 
         // Save the raw shared secret as the encryption key for tunnel PSK
@@ -215,6 +220,18 @@ impl<R: RpPairingSocketProvider> RemotePairingClient<R> {
 
         // ChaCha20Poly1305 AEAD cipher
         let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&okm));
+
+        if !device_signed(
+            &cipher,
+            &data,
+            &host_public_key,
+            device_public_key.as_bytes(),
+            &device_key,
+        ) {
+            warn!("pair-verify M2 is not signed by the paired device");
+            self.send_pair_verified_failed().await?;
+            return Err(RemotePairingError::DeviceNotVerified.into());
+        }
 
         let ed25519_signing_key = &mut pairing_file.e_private_key;
 
@@ -374,6 +391,7 @@ impl<R: RpPairingSocketProvider> RemotePairingClient<R> {
         let peer_device = peer_device::parse_peer_device_from_tlv(&tlv)?;
 
         pairing_file.alt_irk = Some(peer_device.alt_irk.clone());
+        pairing_file.device_public_key = Some(device_key_from_m6(&tlv)?);
         self.paired_peer_device = Some(peer_device);
 
         Ok(())
@@ -745,7 +763,7 @@ impl<R: RpPairingSocketProvider> RemotePairingClient<R> {
                     aad: b"",
                 },
             )
-            .expect("decryption failure!");
+            .map_err(RemotePairingError::ChachaEncryption)?;
 
         let tlv = tlv::deserialize_tlv8(&plaintext)?;
 
@@ -920,6 +938,57 @@ impl<R: RpPairingSocketProvider> RemotePairingClient<R> {
     }
 }
 
+/// Whether pair-verify M2 proves the peer holds the device's long-term key: its `EncryptedData`, under the session
+/// key and the nonce `PV-Msg02`, holds the device's identifier and an Ed25519 signature over the device's ephemeral
+/// key, that identifier and this host's ephemeral key (HAP pair-verify M2).
+fn device_signed(
+    cipher: &ChaCha20Poly1305,
+    m2: &[tlv::TLV8Entry],
+    host_public_key: &[u8; 32],
+    device_ephemeral_key: &[u8; 32],
+    device_key: &ed25519_dalek::VerifyingKey,
+) -> bool {
+    let encrypted = tlv::collect_component_data(m2, tlv::PairingDataComponentType::EncryptedData);
+    if encrypted.is_empty() {
+        return false;
+    }
+    let Ok(plaintext) = cipher.decrypt(
+        Nonce::from_slice(b"\x00\x00\x00\x00PV-Msg02"),
+        Payload {
+            msg: &encrypted,
+            aad: b"",
+        },
+    ) else {
+        return false;
+    };
+    let Ok(inner) = tlv::deserialize_tlv8(&plaintext) else {
+        return false;
+    };
+    let identifier = tlv::collect_component_data(&inner, tlv::PairingDataComponentType::Identifier);
+    let Ok(signature) = Signature::from_slice(&tlv::collect_component_data(
+        &inner,
+        tlv::PairingDataComponentType::Signature,
+    )) else {
+        return false;
+    };
+    let mut signed = Vec::with_capacity(64 + identifier.len());
+    signed.extend_from_slice(device_ephemeral_key);
+    signed.extend_from_slice(&identifier);
+    signed.extend_from_slice(host_public_key);
+    device_key.verify_strict(&signed, &signature).is_ok()
+}
+
+/// The device's long-term Ed25519 public key from the decrypted TLV of pair-setup M6.
+fn device_key_from_m6(m6: &[tlv::TLV8Entry]) -> Result<[u8; 32], IdeviceError> {
+    tlv::collect_component_data(m6, tlv::PairingDataComponentType::PublicKey)
+        .try_into()
+        .map_err(|_| {
+            IdeviceError::UnexpectedResponse(
+                "pair-setup M6 carries no 32-byte device public key".into(),
+            )
+        })
+}
+
 impl<R: RpPairingSocketProvider> std::fmt::Debug for RemotePairingClient<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RemotePairingClient")
@@ -927,5 +996,295 @@ impl<R: RpPairingSocketProvider> std::fmt::Debug for RemotePairingClient<R> {
             .field("sequence_number", &self.sequence_number)
             .field("sending_host", &self.sending_host)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::pin::Pin;
+
+    use ed25519_dalek::{Signer as _, SigningKey};
+
+    use super::*;
+
+    /// The device side of pair-verify, as HAP describes it: M2 carries the device's X25519 key and, encrypted with
+    /// the session key, its identifier and an Ed25519 signature over both ephemeral keys.
+    #[derive(Debug)]
+    struct FakeDevice {
+        signs_with: SigningKey,
+        identifier: String,
+        m2: M2,
+        replies: VecDeque<plist::Value>,
+        m3_received: bool,
+        told_failed: bool,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum M2 {
+        Signed,
+        WithoutEncryptedData,
+        SignedOverOtherKeys,
+    }
+
+    impl FakeDevice {
+        fn new(signs_with: &SigningKey, m2: M2) -> Self {
+            Self {
+                signs_with: signs_with.clone(),
+                identifier: "D3V1C3-ID".into(),
+                m2,
+                replies: VecDeque::new(),
+                m3_received: false,
+                told_failed: false,
+            }
+        }
+
+        fn pairing_data(value: &serde_json::Value) -> Option<Vec<tlv::TLV8Entry>> {
+            let data = value["event"]["_0"]["pairingData"]["_0"]["data"].as_str()?;
+            tlv::deserialize_tlv8(
+                &base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .ok()?,
+            )
+            .ok()
+        }
+
+        fn reply(entries: &[tlv::TLV8Entry]) -> plist::Value {
+            let data =
+                base64::engine::general_purpose::STANDARD.encode(tlv::serialize_tlv8(entries));
+            plist!({"event": {"_0": {"pairingData": {"_0": {"data": data}}}}})
+        }
+
+        fn answer_m1(&mut self, host_key: [u8; 32]) {
+            let secret = EphemeralSecret::random_from_rng(OsRng);
+            let device_key = X25519PublicKey::from(&secret);
+            let shared = secret.diffie_hellman(&X25519PublicKey::from(host_key));
+            let hk = Hkdf::<Sha512>::new(Some(b"Pair-Verify-Encrypt-Salt"), shared.as_bytes());
+            let mut okm = [0u8; 32];
+            hk.expand(b"Pair-Verify-Encrypt-Info", &mut okm).unwrap();
+            let other = X25519PublicKey::from(&EphemeralSecret::random_from_rng(OsRng));
+            let signed_host_key = match self.m2 {
+                M2::SignedOverOtherKeys => *other.as_bytes(),
+                _ => host_key,
+            };
+            let mut signbuf = device_key.as_bytes().to_vec();
+            signbuf.extend_from_slice(self.identifier.as_bytes());
+            signbuf.extend_from_slice(&signed_host_key);
+            let signature = self.signs_with.sign(&signbuf);
+            let inner = tlv::serialize_tlv8(&[
+                tlv::TLV8Entry {
+                    tlv_type: tlv::PairingDataComponentType::Identifier,
+                    data: self.identifier.as_bytes().to_vec(),
+                },
+                tlv::TLV8Entry {
+                    tlv_type: tlv::PairingDataComponentType::Signature,
+                    data: signature.to_vec(),
+                },
+            ]);
+            let encrypted = ChaCha20Poly1305::new(Key::from_slice(&okm))
+                .encrypt(
+                    Nonce::from_slice(b"\x00\x00\x00\x00PV-Msg02"),
+                    Payload {
+                        msg: &inner,
+                        aad: b"",
+                    },
+                )
+                .unwrap();
+            let mut entries = vec![
+                tlv::TLV8Entry {
+                    tlv_type: tlv::PairingDataComponentType::State,
+                    data: vec![0x02],
+                },
+                tlv::TLV8Entry {
+                    tlv_type: tlv::PairingDataComponentType::PublicKey,
+                    data: device_key.as_bytes().to_vec(),
+                },
+            ];
+            if self.m2 != M2::WithoutEncryptedData {
+                entries.push(tlv::TLV8Entry {
+                    tlv_type: tlv::PairingDataComponentType::EncryptedData,
+                    data: encrypted,
+                });
+            }
+            self.replies.push_back(Self::reply(&entries));
+        }
+    }
+
+    impl RpPairingSocketProvider for FakeDevice {
+        fn send_plain(
+            &mut self,
+            value: impl Serialize,
+            _seq: usize,
+        ) -> Pin<Box<dyn Future<Output = Result<(), IdeviceError>> + Send + '_>> {
+            let value = serde_json::to_value(&value).unwrap();
+            if value["event"]["_0"].get("pairVerifyFailed").is_some() {
+                self.told_failed = true;
+            } else if let Some(entries) = Self::pairing_data(&value) {
+                let state =
+                    tlv::collect_component_data(&entries, tlv::PairingDataComponentType::State);
+                if state == [0x01] {
+                    let key = tlv::collect_component_data(
+                        &entries,
+                        tlv::PairingDataComponentType::PublicKey,
+                    );
+                    self.answer_m1(key.try_into().unwrap());
+                } else if state == [0x03] {
+                    self.m3_received = true;
+                    self.replies.push_back(Self::reply(&[tlv::TLV8Entry {
+                        tlv_type: tlv::PairingDataComponentType::State,
+                        data: vec![0x04],
+                    }]));
+                }
+            }
+            Box::pin(async { Ok(()) })
+        }
+
+        fn send_encrypted(
+            &mut self,
+            _ciphertext: Vec<u8>,
+            _seq: usize,
+        ) -> Pin<Box<dyn Future<Output = Result<(), IdeviceError>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn recv_plain<'a>(
+            &'a mut self,
+        ) -> Pin<Box<dyn Future<Output = Result<plist::Value, IdeviceError>> + Send + 'a>> {
+            let reply = self.replies.pop_front();
+            Box::pin(async move {
+                reply.ok_or(IdeviceError::UnexpectedResponse(
+                    "the fake device has nothing to say".into(),
+                ))
+            })
+        }
+
+        fn serialize_bytes(b: &[u8]) -> plist::Value {
+            plist!(base64::engine::general_purpose::STANDARD.encode(b))
+        }
+
+        fn deserialize_bytes(v: plist::Value) -> Option<Vec<u8>> {
+            match v {
+                plist::Value::String(s) => base64::engine::general_purpose::STANDARD.decode(s).ok(),
+                _ => None,
+            }
+        }
+    }
+
+    fn record_for(device: &SigningKey) -> RpPairingFile {
+        let mut record = RpPairingFile::generate("test-host");
+        record.device_public_key = Some(device.verifying_key().to_bytes());
+        record
+    }
+
+    async fn verify(
+        device: FakeDevice,
+        record: &mut RpPairingFile,
+    ) -> (Result<(), IdeviceError>, FakeDevice) {
+        let mut client = RemotePairingClient::new(device, "test-host");
+        let verified = client.validate_pairing(record).await;
+        (verified, client.inner)
+    }
+
+    #[tokio::test]
+    async fn a_device_that_signs_with_the_key_it_paired_with_is_verified() {
+        let device = SigningKey::generate(&mut OsRng);
+        let mut record = record_for(&device);
+        let (verified, fake) = verify(FakeDevice::new(&device, M2::Signed), &mut record).await;
+        verified.unwrap();
+        assert!(fake.m3_received);
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_signs_with_another_key_is_refused_before_this_host_signs_m3() {
+        let device = SigningKey::generate(&mut OsRng);
+        let impostor = SigningKey::generate(&mut OsRng);
+        let mut record = record_for(&device);
+        let (verified, fake) = verify(FakeDevice::new(&impostor, M2::Signed), &mut record).await;
+        assert!(
+            matches!(
+                verified,
+                Err(IdeviceError::RemotePairing(
+                    RemotePairingError::DeviceNotVerified
+                ))
+            ),
+            "{verified:?}"
+        );
+        assert!(!fake.m3_received);
+        assert!(fake.told_failed);
+    }
+
+    #[tokio::test]
+    async fn a_signature_over_other_ephemeral_keys_is_refused() {
+        let device = SigningKey::generate(&mut OsRng);
+        let mut record = record_for(&device);
+        let (verified, fake) = verify(
+            FakeDevice::new(&device, M2::SignedOverOtherKeys),
+            &mut record,
+        )
+        .await;
+        assert!(
+            matches!(
+                verified,
+                Err(IdeviceError::RemotePairing(
+                    RemotePairingError::DeviceNotVerified
+                ))
+            ),
+            "{verified:?}"
+        );
+        assert!(!fake.m3_received);
+    }
+
+    #[tokio::test]
+    async fn an_m2_without_encrypted_data_is_refused() {
+        let device = SigningKey::generate(&mut OsRng);
+        let mut record = record_for(&device);
+        let (verified, fake) = verify(
+            FakeDevice::new(&device, M2::WithoutEncryptedData),
+            &mut record,
+        )
+        .await;
+        assert!(
+            matches!(
+                verified,
+                Err(IdeviceError::RemotePairing(
+                    RemotePairingError::DeviceNotVerified
+                ))
+            ),
+            "{verified:?}"
+        );
+        assert!(!fake.m3_received);
+    }
+
+    #[tokio::test]
+    async fn a_record_without_the_device_key_is_refused_before_anything_is_sent() {
+        let device = SigningKey::generate(&mut OsRng);
+        let mut record = RpPairingFile::generate("test-host");
+        let (verified, fake) = verify(FakeDevice::new(&device, M2::Signed), &mut record).await;
+        assert!(
+            matches!(
+                verified,
+                Err(IdeviceError::RemotePairing(RemotePairingError::NoDeviceKey))
+            ),
+            "{verified:?}"
+        );
+        assert!(!fake.m3_received);
+        assert!(!fake.told_failed);
+    }
+
+    #[test]
+    fn the_device_key_is_read_from_pair_setup_m6() {
+        let key = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
+        let m6 = [
+            tlv::TLV8Entry {
+                tlv_type: tlv::PairingDataComponentType::Identifier,
+                data: b"D3V1C3-ID".to_vec(),
+            },
+            tlv::TLV8Entry {
+                tlv_type: tlv::PairingDataComponentType::PublicKey,
+                data: key.to_vec(),
+            },
+        ];
+        assert_eq!(device_key_from_m6(&m6).unwrap(), key);
+        assert!(device_key_from_m6(&m6[..1]).is_err());
     }
 }

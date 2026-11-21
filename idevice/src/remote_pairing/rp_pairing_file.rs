@@ -8,7 +8,7 @@ use plist::Dictionary;
 use plist_macro::plist_to_xml_bytes;
 use rsa::rand_core::OsRng;
 use serde::de::Error;
-use tracing::{debug, warn};
+use tracing::warn;
 
 use crate::IdeviceError;
 
@@ -18,6 +18,9 @@ pub struct RpPairingFile {
     pub e_public_key: VerifyingKey,
     pub identifier: String,
     pub alt_irk: Option<Vec<u8>>,
+    /// The device's long-term Ed25519 public key from pair-setup M6, which pair-verify checks the device's
+    /// signature against. Records written before it was kept have none and must pair again.
+    pub device_public_key: Option<[u8; 32]>,
 }
 
 impl RpPairingFile {
@@ -54,6 +57,7 @@ impl RpPairingFile {
             e_public_key: ed25519_public_key,
             identifier,
             alt_irk: None,
+            device_public_key: None,
         }
     }
 
@@ -63,6 +67,7 @@ impl RpPairingFile {
         self.e_public_key = ed25519_public_key;
         self.e_private_key = ed25519_private_key;
         self.alt_irk = None;
+        self.device_public_key = None;
     }
 
     /// Serialize to XML plist bytes.
@@ -83,13 +88,15 @@ impl RpPairingFile {
         if let Some(irk) = &self.alt_irk {
             dict.insert("alt_irk".into(), plist::Value::Data(irk.clone()));
         }
+        if let Some(key) = &self.device_public_key {
+            dict.insert("device_public_key".into(), plist::Value::Data(key.to_vec()));
+        }
         plist_to_xml_bytes(&dict)
     }
 
     /// Parse from plist bytes (XML or binary).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, IdeviceError> {
         let mut p: Dictionary = plist::from_bytes(bytes)?;
-        debug!("Read dictionary for rppairingfile: {p:#?}");
 
         let public_key = match p
             .remove("public_key")
@@ -138,11 +145,17 @@ impl RpPairingFile {
             }
         };
 
+        let device_public_key = p
+            .remove("device_public_key")
+            .and_then(|x| x.into_data())
+            .and_then(|x| <[u8; 32]>::try_from(x).ok());
+
         Ok(Self {
             e_private_key: private_key,
             e_public_key: public_key,
             identifier,
             alt_irk,
+            device_public_key,
         })
     }
 
@@ -165,6 +178,35 @@ impl std::fmt::Debug for RpPairingFile {
             .field("e_public_key", &self.e_public_key)
             .field("identifier", &self.identifier)
             .field("alt_irk", &self.alt_irk)
+            .field("device_public_key", &self.device_public_key)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_device_key_survives_a_round_trip_and_an_older_record_reads_without_it() {
+        let mut record = RpPairingFile::generate("test-host");
+        record.alt_irk = Some(vec![7; 16]);
+        record.device_public_key = Some([9; 32]);
+        let back = RpPairingFile::from_bytes(&record.to_bytes()).unwrap();
+        assert_eq!(back.device_public_key, Some([9; 32]));
+        assert_eq!(back.alt_irk(), Some(&[7u8; 16][..]));
+
+        record.device_public_key = None;
+        let older = RpPairingFile::from_bytes(&record.to_bytes()).unwrap();
+        assert_eq!(older.device_public_key, None);
+        assert_eq!(older.identifier(), record.identifier());
+    }
+
+    #[test]
+    fn a_new_signing_key_forgets_the_device_it_paired_with() {
+        let mut record = RpPairingFile::generate("test-host");
+        record.device_public_key = Some([9; 32]);
+        record.recreate_signing_keys();
+        assert_eq!(record.device_public_key, None);
     }
 }
